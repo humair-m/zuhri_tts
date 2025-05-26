@@ -738,7 +738,10 @@ class Attention(nn.Module):
 
 class ForwardAttentionV2(nn.Module):
     """
-    Enhanced forward attention mechanism with modern improvements.
+    Enhanced forward attention mechanism with monotonic constraints and improved stability.
+    
+    This implementation provides better numerical stability and includes modern improvements
+    like temperature scaling, dropout, and enhanced weight initialization.
     """
     
     def __init__(self, 
@@ -748,71 +751,187 @@ class ForwardAttentionV2(nn.Module):
                  attention_location_n_filters: int, 
                  attention_location_kernel_size: int,
                  dropout: float = 0.0,
-                 temperature: float = 1.0):
-        """Initialize ForwardAttentionV2 with enhanced features."""
+                 temperature: float = 1.0,
+                 use_location_layer: bool = True):
+        """
+        Initialize ForwardAttentionV2.
+        
+        Args:
+            attention_rnn_dim: Dimension of attention RNN hidden state
+            embedding_dim: Dimension of encoder embeddings
+            attention_dim: Dimension of attention mechanism
+            attention_location_n_filters: Number of filters in location layer
+            attention_location_kernel_size: Kernel size for location convolution
+            dropout: Dropout probability for regularization
+            temperature: Temperature scaling for attention weights
+            use_location_layer: Whether to use location-aware attention
+        """
         super(ForwardAttentionV2, self).__init__()
         
         self.temperature = temperature
+        self.use_location_layer = use_location_layer
         
+        # Core attention components
         self.query_layer = LinearNorm(
-            attention_rnn_dim, attention_dim,
-            bias=False, w_init_gain='tanh', dropout=dropout
+            attention_rnn_dim, attention_dim, bias=False, 
+            w_init_gain='tanh', dropout=dropout
         )
         self.memory_layer = LinearNorm(
             embedding_dim, attention_dim, bias=False,
             w_init_gain='tanh', dropout=dropout
         )
         self.v = LinearNorm(attention_dim, 1, bias=False, dropout=dropout)
-        self.location_layer = LocationLayer(
-            attention_location_n_filters,
-            attention_location_kernel_size,
-            attention_dim, dropout=dropout
-        )
         
+        # Location layer for location-aware attention
+        if use_location_layer:
+            self.location_layer = LocationLayer(
+                attention_location_n_filters, attention_location_kernel_size,
+                attention_dim, dropout=dropout
+            )
+        
+        # Numerical stability improvements
         self.score_mask_value = -1e20  # More stable than -inf
+        self.eps = 1e-8  # Small epsilon for numerical stability
+        
+        # Dropout for attention weights
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
 
     def get_alignment_energies(self, 
                              query: Tensor, 
                              processed_memory: Tensor,
-                             attention_weights_cat: Tensor) -> Tensor:
-        """Compute alignment energies with temperature scaling."""
+                             attention_weights_cat: Optional[Tensor] = None) -> Tensor:
+        """
+        Compute alignment energies between query and memory.
+        
+        Args:
+            query: Decoder output [B, attention_rnn_dim]
+            processed_memory: Processed encoder outputs [B, T_in, attention_dim]
+            attention_weights_cat: Previous and cumulative attention weights [B, 2, T_in]
+            
+        Returns:
+            Alignment energies [B, T_in]
+        """
+        # Process query: [B, attention_rnn_dim] -> [B, 1, attention_dim]
         processed_query = self.query_layer(query.unsqueeze(1))
-        processed_attention_weights = self.location_layer(attention_weights_cat)
         
-        energies = self.v(torch.tanh(
-            processed_query + processed_attention_weights + processed_memory
-        ))
+        # Compute base attention energies
+        if self.use_location_layer and attention_weights_cat is not None:
+            # Location-aware attention
+            processed_attention_weights = self.location_layer(attention_weights_cat)
+            energies = self.v(torch.tanh(
+                processed_query + processed_attention_weights + processed_memory
+            ))
+        else:
+            # Standard additive attention
+            energies = self.v(torch.tanh(processed_query + processed_memory))
         
+        # Apply temperature scaling and squeeze: [B, T_in, 1] -> [B, T_in]
         energies = energies.squeeze(-1) / self.temperature
         return energies
+
+    def _compute_forward_attention(self, 
+                                 log_energy: Tensor, 
+                                 log_alpha: Tensor) -> Tensor:
+        """
+        Compute forward attention with monotonic constraints.
+        
+        Args:
+            log_energy: Log alignment energies [B, T_in]
+            log_alpha: Previous log attention weights [B, T_in]
+            
+        Returns:
+            New log attention weights [B, T_in]
+        """
+        batch_size, max_time = log_energy.size()
+        
+        # Prepare shifted versions of log_alpha for forward attention
+        log_alpha_shift_padded = []
+        
+        for shift in range(2):  # Consider staying (shift=0) and moving (shift=1)
+            if shift == 0:
+                # Stay at current position
+                shifted = log_alpha
+            else:
+                # Move to next position
+                shifted = log_alpha[:, :max_time-shift]
+                # Pad with mask value to maintain size
+                shifted = F.pad(shifted, (shift, 0), 'constant', self.score_mask_value)
+            
+            log_alpha_shift_padded.append(shifted.unsqueeze(2))
+        
+        # Combine shifted versions: [B, T_in, 2] -> [B, T_in]
+        log_alpha_combined = torch.cat(log_alpha_shift_padded, dim=2)
+        
+        # Compute log-sum-exp for numerical stability
+        biased = torch.logsumexp(log_alpha_combined, dim=2)
+        
+        # Add content-based attention energies
+        log_alpha_new = biased + log_energy
+        
+        return log_alpha_new
 
     def forward(self, 
                 attention_hidden_state: Tensor, 
                 memory: Tensor, 
                 processed_memory: Tensor,
                 attention_weights_cat: Tensor, 
-                mask: Optional[Tensor], 
-                log_alpha: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+                mask: Optional[Tensor],
+                log_alpha: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        Forward pass with monotonic attention constraints.
+        Forward pass of ForwardAttentionV2.
         
+        Args:
+            attention_hidden_state: Attention RNN last output [B, attention_rnn_dim]
+            memory: Encoder outputs [B, T_in, embedding_dim]
+            processed_memory: Processed encoder outputs [B, T_in, attention_dim]
+            attention_weights_cat: Previous and cumulative attention weights [B, 2, T_in]
+            mask: Binary mask for padded data [B, T_in]
+            log_alpha: Previous log attention weights [B, T_in]
+            
         Returns:
-            Tuple of (attention_context, attention_weights, log_alpha_new)
+            Tuple of:
+                - attention_context: Weighted context vector [B, embedding_dim]
+                - attention_weights: Current attention weights [B, T_in]
+                - log_alpha_new: Updated log attention weights [B, T_in]
         """
+        # Compute alignment energies
         log_energy = self.get_alignment_energies(
             attention_hidden_state, processed_memory, attention_weights_cat
         )
-
+        
+        # Apply padding mask
         if mask is not None:
             log_energy = log_energy.masked_fill(mask, self.score_mask_value)
-
-        # Compute forward attention with improved numerical stability
-        log_alpha_shift_padded = []
-        max_time = log_energy.size(1)
         
-        for sft in range(2):
-            if sft == 0:
-                shifted = log_alpha
-            else:
-                shifte
+        # Compute forward attention with monotonic constraints
+        log_alpha_new = self._compute_forward_attention(log_energy, log_alpha)
+        
+        # Convert to attention weights with numerical stability
+        attention_weights = F.softmax(log_alpha_new, dim=1)
+        
+        # Apply dropout during training
+        if self.dropout is not None and self.training:
+            attention_weights = self.dropout(attention_weights)
+        
+        # Compute attention context
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory)
+        attention_context = attention_context.squeeze(1)
+        
+        return attention_context, attention_weights, log_alpha_new
+
+    def init_attention_weights(self, batch_size: int, max_time: int, device: torch.device) -> Tensor:
+        """
+        Initialize attention weights for the beginning of sequence.
+        
+        Args:
+            batch_size: Batch size
+            max_time: Maximum sequence length
+            device: Device to create tensors on
+            
+        Returns:
+            Initial log attention weights [B, T_in]
+        """
+        # Initialize with attention focused on the first position
+        log_alpha = torch.full((batch_size, max_time), self.score_mask_value, device=device)
+        log_alpha[:, 0] = 0.0  # Focus on first position initially
+        return log_alpha
