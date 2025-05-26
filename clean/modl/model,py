@@ -1,0 +1,1191 @@
+# -*- coding: utf-8 -*-
+"""
+StyleTTS2: Towards Human-Level Text-to-Speech through Style Diffusion and Adversarial Training
+Complete implementation with improved structure and documentation.
+"""
+
+import os
+import math
+from typing import Optional, Tuple, List
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import weight_norm, spectral_norm
+import yaml
+from munch import Munch
+
+
+class Conv1dAdaIN(nn.Module):
+    """1D Convolution with Adaptive Instance Normalization."""
+    
+    def __init__(self, channels: int, style_dim: int, kernel_size: int = 3, padding: int = 1):
+        super().__init__()
+        self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)
+        self.norm = nn.InstanceNorm1d(channels, affine=False)
+        self.style_to_params = nn.Linear(style_dim, channels * 2)
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        x = self.norm(x)
+        style_params = self.style_to_params(style).unsqueeze(2)
+        gamma, beta = torch.chunk(style_params, 2, dim=1)
+        return gamma * x + beta
+
+
+class LayerNorm(nn.Module):
+    """1D Layer Normalization for sequence data."""
+    
+    def __init__(self, channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, -1)
+        x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
+        return x.transpose(1, -1)
+
+
+class LinearNorm(nn.Module):
+    """Linear layer with Xavier initialization."""
+    
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = True, w_init_gain: str = 'linear'):
+        super().__init__()
+        self.linear_layer = nn.Linear(in_dim, out_dim, bias=bias)
+        nn.init.xavier_uniform_(
+            self.linear_layer.weight,
+            gain=nn.init.calculate_gain(w_init_gain)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear_layer(x)
+
+
+# ================== Sampling Modules ==================
+
+class LearnedDownSample(nn.Module):
+    """Learnable downsampling with different strategies."""
+    
+    def __init__(self, layer_type: str, dim_in: int):
+        super().__init__()
+        self.layer_type = layer_type
+
+        if layer_type == 'none':
+            self.conv = nn.Identity()
+        elif layer_type == 'timepreserve':
+            self.conv = spectral_norm(
+                nn.Conv2d(dim_in, dim_in, kernel_size=(3, 1), stride=(2, 1), 
+                         groups=dim_in, padding=(1, 0))
+            )
+        elif layer_type == 'half':
+            self.conv = spectral_norm(
+                nn.Conv2d(dim_in, dim_in, kernel_size=(3, 3), stride=(2, 2), 
+                         groups=dim_in, padding=1)
+            )
+        else:
+            raise ValueError(f'Unexpected downsample type: {layer_type}. '
+                           f'Expected: [none, timepreserve, half]')
+            
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class LearnedUpSample(nn.Module):
+    """Learnable upsampling with different strategies."""
+    
+    def __init__(self, layer_type: str, dim_in: int):
+        super().__init__()
+        self.layer_type = layer_type
+        
+        if layer_type == 'none':
+            self.conv = nn.Identity()
+        elif layer_type == 'timepreserve':
+            self.conv = nn.ConvTranspose2d(
+                dim_in, dim_in, kernel_size=(3, 1), stride=(2, 1), 
+                groups=dim_in, output_padding=(1, 0), padding=(1, 0)
+            )
+        elif layer_type == 'half':
+            self.conv = nn.ConvTranspose2d(
+                dim_in, dim_in, kernel_size=(3, 3), stride=(2, 2), 
+                groups=dim_in, output_padding=1, padding=1
+            )
+        else:
+            raise ValueError(f'Unexpected upsample type: {layer_type}. '
+                           f'Expected: [none, timepreserve, half]')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class DownSample(nn.Module):
+    """Standard downsampling using average pooling."""
+    
+    def __init__(self, layer_type: str):
+        super().__init__()
+        self.layer_type = layer_type
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.layer_type == 'none':
+            return x
+        elif self.layer_type == 'timepreserve':
+            return F.avg_pool2d(x, (2, 1))
+        elif self.layer_type == 'half':
+            if x.shape[-1] % 2 != 0:
+                x = torch.cat([x, x[..., -1].unsqueeze(-1)], dim=-1)
+            return F.avg_pool2d(x, 2)
+        else:
+            raise ValueError(f'Unexpected downsample type: {self.layer_type}. '
+                           f'Expected: [none, timepreserve, half]')
+
+
+class UpSample(nn.Module):
+    """Standard upsampling using interpolation."""
+    
+    def __init__(self, layer_type: str):
+        super().__init__()
+        self.layer_type = layer_type
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.layer_type == 'none':
+            return x
+        elif self.layer_type == 'timepreserve':
+            return F.interpolate(x, scale_factor=(2, 1), mode='nearest')
+        elif self.layer_type == 'half':
+            return F.interpolate(x, scale_factor=2, mode='nearest')
+        else:
+            raise ValueError(f'Unexpected upsample type: {self.layer_type}. '
+                           f'Expected: [none, timepreserve, half]')
+
+
+class UpSample1d(nn.Module):
+    """1D upsampling using interpolation."""
+    
+    def __init__(self, layer_type: str):
+        super().__init__()
+        self.layer_type = layer_type
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.layer_type == 'none':
+            return x
+        else:
+            return F.interpolate(x, scale_factor=2, mode='nearest')
+
+
+# ================== Residual Blocks ==================
+
+class ResBlk(nn.Module):
+    """2D Residual Block with optional normalization and downsampling."""
+    
+    def __init__(self, dim_in: int, dim_out: int, actv=nn.LeakyReLU(0.2),
+                 normalize: bool = False, downsample: str = 'none'):
+        super().__init__()
+        self.actv = actv
+        self.normalize = normalize
+        self.downsample = DownSample(downsample)
+        self.downsample_res = LearnedDownSample(downsample, dim_in)
+        self.learned_sc = dim_in != dim_out
+        self._build_weights(dim_in, dim_out)
+
+    def _build_weights(self, dim_in: int, dim_out: int):
+        self.conv1 = spectral_norm(nn.Conv2d(dim_in, dim_in, 3, 1, 1))
+        self.conv2 = spectral_norm(nn.Conv2d(dim_in, dim_out, 3, 1, 1))
+        
+        if self.normalize:
+            self.norm1 = nn.InstanceNorm2d(dim_in, affine=True)
+            self.norm2 = nn.InstanceNorm2d(dim_in, affine=True)
+            
+        if self.learned_sc:
+            self.conv1x1 = spectral_norm(nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False))
+
+    def _shortcut(self, x: torch.Tensor) -> torch.Tensor:
+        if self.learned_sc:
+            x = self.conv1x1(x)
+        if self.downsample:
+            x = self.downsample(x)
+        return x
+
+    def _residual(self, x: torch.Tensor) -> torch.Tensor:
+        if self.normalize:
+            x = self.norm1(x)
+        x = self.actv(x)
+        x = self.conv1(x)
+        x = self.downsample_res(x)
+        
+        if self.normalize:
+            x = self.norm2(x)
+        x = self.actv(x)
+        x = self.conv2(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (self._shortcut(x) + self._residual(x)) / math.sqrt(2)
+
+
+class ResBlk1d(nn.Module):
+    """1D Residual Block with dropout and downsampling."""
+    
+    def __init__(self, dim_in: int, dim_out: int, actv=nn.LeakyReLU(0.2),
+                 normalize: bool = False, downsample: str = 'none', dropout_p: float = 0.2):
+        super().__init__()
+        self.actv = actv
+        self.normalize = normalize
+        self.downsample_type = downsample
+        self.learned_sc = dim_in != dim_out
+        self.dropout_p = dropout_p
+        
+        self._build_weights(dim_in, dim_out)
+        
+        if downsample == 'none':
+            self.pool = nn.Identity()
+        else:
+            self.pool = weight_norm(
+                nn.Conv1d(dim_in, dim_in, kernel_size=3, stride=2, groups=dim_in, padding=1)
+            )
+
+    def _build_weights(self, dim_in: int, dim_out: int):
+        self.conv1 = weight_norm(nn.Conv1d(dim_in, dim_in, 3, 1, 1))
+        self.conv2 = weight_norm(nn.Conv1d(dim_in, dim_out, 3, 1, 1))
+        
+        if self.normalize:
+            self.norm1 = nn.InstanceNorm1d(dim_in, affine=True)
+            self.norm2 = nn.InstanceNorm1d(dim_in, affine=True)
+            
+        if self.learned_sc:
+            self.conv1x1 = weight_norm(nn.Conv1d(dim_in, dim_out, 1, 1, 0, bias=False))
+
+    def _downsample(self, x: torch.Tensor) -> torch.Tensor:
+        if self.downsample_type == 'none':
+            return x
+        else:
+            if x.shape[-1] % 2 != 0:
+                x = torch.cat([x, x[..., -1].unsqueeze(-1)], dim=-1)
+            return F.avg_pool1d(x, 2)
+
+    def _shortcut(self, x: torch.Tensor) -> torch.Tensor:
+        if self.learned_sc:
+            x = self.conv1x1(x)
+        return self._downsample(x)
+
+    def _residual(self, x: torch.Tensor) -> torch.Tensor:
+        if self.normalize:
+            x = self.norm1(x)
+        x = self.actv(x)
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        
+        x = self.conv1(x)
+        x = self.pool(x)
+        
+        if self.normalize:
+            x = self.norm2(x)
+        x = self.actv(x)
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        
+        x = self.conv2(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (self._shortcut(x) + self._residual(x)) / math.sqrt(2)
+
+
+# ================== Adaptive Normalization ==================
+
+class AdaIN1d(nn.Module):
+    """1D Adaptive Instance Normalization."""
+    
+    def __init__(self, style_dim: int, num_features: int):
+        super().__init__()
+        self.norm = nn.InstanceNorm1d(num_features, affine=False)
+        self.fc = nn.Linear(style_dim, num_features * 2)
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        h = self.fc(s)
+        h = h.view(h.size(0), h.size(1), 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+        return (1 + gamma) * self.norm(x) + beta
+
+
+class AdaLayerNorm(nn.Module):
+    """Adaptive Layer Normalization."""
+    
+    def __init__(self, style_dim: int, channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.fc = nn.Linear(style_dim, channels * 2)
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(-1, -2).transpose(1, -1)
+        
+        h = self.fc(s)
+        h = h.view(h.size(0), h.size(1), 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+        gamma, beta = gamma.transpose(1, -1), beta.transpose(1, -1)
+        
+        x = F.layer_norm(x, (self.channels,), eps=self.eps)
+        x = (1 + gamma) * x + beta
+        
+        return x.transpose(1, -1).transpose(-1, -2)
+
+
+class AdainResBlk1d(nn.Module):
+    """1D Residual Block with Adaptive Instance Normalization."""
+    
+    def __init__(self, dim_in: int, dim_out: int, style_dim: int = 64, 
+                 actv=nn.LeakyReLU(0.2), upsample: str = 'none', dropout_p: float = 0.0):
+        super().__init__()
+        self.actv = actv
+        self.upsample_type = upsample
+        self.upsample = UpSample1d(upsample)
+        self.learned_sc = dim_in != dim_out
+        self.dropout = nn.Dropout(dropout_p)
+        
+        self._build_weights(dim_in, dim_out, style_dim)
+        
+        if upsample == 'none':
+            self.pool = nn.Identity()
+        else:
+            self.pool = weight_norm(
+                nn.ConvTranspose1d(dim_in, dim_in, kernel_size=3, stride=2,
+                                 groups=dim_in, padding=1, output_padding=1)
+            )
+        
+    def _build_weights(self, dim_in: int, dim_out: int, style_dim: int):
+        self.conv1 = weight_norm(nn.Conv1d(dim_in, dim_out, 3, 1, 1))
+        self.conv2 = weight_norm(nn.Conv1d(dim_out, dim_out, 3, 1, 1))
+        self.norm1 = AdaIN1d(style_dim, dim_in)
+        self.norm2 = AdaIN1d(style_dim, dim_out)
+        
+        if self.learned_sc:
+            self.conv1x1 = weight_norm(nn.Conv1d(dim_in, dim_out, 1, 1, 0, bias=False))
+
+    def _shortcut(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.upsample(x)
+        if self.learned_sc:
+            x = self.conv1x1(x)
+        return x
+
+    def _residual(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(x, s)
+        x = self.actv(x)
+        x = self.pool(x)
+        x = self.conv1(self.dropout(x))
+        x = self.norm2(x, s)
+        x = self.actv(x)
+        x = self.conv2(self.dropout(x))
+        return x
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        out = self._residual(x, s)
+        return (out + self._shortcut(x)) / math.sqrt(2)
+
+
+# ================== Encoders ==================
+
+class StyleEncoder(nn.Module):
+    """Style Encoder that extracts style embeddings from mel-spectrograms."""
+    
+    def __init__(self, dim_in: int = 48, style_dim: int = 48, max_conv_dim: int = 384):
+        super().__init__()
+        
+        blocks = [spectral_norm(nn.Conv2d(1, dim_in, 3, 1, 1))]
+
+        repeat_num = 4
+        for _ in range(repeat_num):
+            dim_out = min(dim_in * 2, max_conv_dim)
+            blocks.append(ResBlk(dim_in, dim_out, downsample='half'))
+            dim_in = dim_out
+
+        blocks.extend([
+            nn.LeakyReLU(0.2),
+            spectral_norm(nn.Conv2d(dim_out, dim_out, 5, 1, 0)),
+            nn.AdaptiveAvgPool2d(1),
+            nn.LeakyReLU(0.2)
+        ])
+        
+        self.shared = nn.Sequential(*blocks)
+        self.unshared = nn.Linear(dim_out, style_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.shared(x)
+        h = h.view(h.size(0), -1)
+        return self.unshared(h)
+
+
+class TextEncoder(nn.Module):
+    """Text Encoder with CNN and bidirectional LSTM."""
+    
+    def __init__(self, channels: int, kernel_size: int, depth: int, 
+                 n_symbols: int, actv=nn.LeakyReLU(0.2)):
+        super().__init__()
+        self.embedding = nn.Embedding(n_symbols, channels)
+
+        padding = (kernel_size - 1) // 2
+        self.cnn = nn.ModuleList()
+        for _ in range(depth):
+            self.cnn.append(nn.Sequential(
+                weight_norm(nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)),
+                LayerNorm(channels),
+                actv,
+                nn.Dropout(0.2),
+            ))
+
+        self.lstm = nn.LSTM(channels, channels // 2, 1, batch_first=True, 
+                           bidirectional=True)
+
+    def forward(self, x: torch.Tensor, input_lengths: torch.Tensor, 
+                m: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(x)  # [B, T, emb]
+        x = x.transpose(1, 2)  # [B, emb, T]
+        
+        m = m.to(input_lengths.device).unsqueeze(1)
+        x.masked_fill_(m, 0.0)
+        
+        for conv_layer in self.cnn:
+            x = conv_layer(x)
+            x.masked_fill_(m, 0.0)
+            
+        x = x.transpose(1, 2)  # [B, T, chn]
+
+        input_lengths = input_lengths.cpu().numpy()
+        x = nn.utils.rnn.pack_padded_sequence(
+            x, input_lengths, batch_first=True, enforce_sorted=False
+        )
+
+        self.lstm.flatten_parameters()
+        x, _ = self.lstm(x)
+        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+                
+        x = x.transpose(-1, -2)
+        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
+        x_pad[:, :, :x.shape[-1]] = x
+        x = x_pad
+        
+        x.masked_fill_(m, 0.0)
+        return x
+
+    def inference(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(x)
+        x = x.transpose(1, 2)
+        
+        for conv_layer in self.cnn:
+            x = conv_layer(x)
+            
+        x = x.transpose(1, 2)
+        self.lstm.flatten_parameters()
+        x, _ = self.lstm(x)
+        return x
+    
+    @staticmethod
+    def length_to_mask(lengths: torch.Tensor) -> torch.Tensor:
+        mask = torch.arange(lengths.max(), device=lengths.device).unsqueeze(0)
+        mask = mask.expand(lengths.shape[0], -1).type_as(lengths)
+        return torch.gt(mask + 1, lengths.unsqueeze(1))
+
+
+class DurationEncoder(nn.Module):
+    """Duration Encoder with LSTM layers and Adaptive Layer Normalization."""
+    
+    def __init__(self, sty_dim: int, d_model: int, nlayers: int, dropout: float = 0.1):
+        super().__init__()
+        self.lstms = nn.ModuleList()
+        
+        for _ in range(nlayers):
+            self.lstms.append(
+                nn.LSTM(d_model + sty_dim, d_model // 2, num_layers=1, 
+                       batch_first=True, bidirectional=True, dropout=dropout)
+            )
+            self.lstms.append(AdaLayerNorm(sty_dim, d_model))
+        
+        self.dropout = dropout
+        self.d_model = d_model
+        self.sty_dim = sty_dim
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor, 
+                text_lengths: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        masks = m.to(text_lengths.device)
+        
+        x = x.permute(2, 0, 1)
+        s = style.expand(x.shape[0], x.shape[1], -1)
+        x = torch.cat([x, s], axis=-1)
+        x.masked_fill_(masks.unsqueeze(-1).transpose(0, 1), 0.0)
+                
+        x = x.transpose(0, 1)
+        input_lengths = text_lengths.cpu().numpy()
+        x = x.transpose(-1, -2)
+        
+        for block in self.lstms:
+            if isinstance(block, AdaLayerNorm):
+                x = block(x.transpose(-1, -2), style).transpose(-1, -2)
+                x = torch.cat([x, s.permute(1, -1, 0)], axis=1)
+                x.masked_fill_(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
+            else:
+                x = x.transpose(-1, -2)
+                x = nn.utils.rnn.pack_padded_sequence(
+                    x, input_lengths, batch_first=True, enforce_sorted=False
+                )
+                block.flatten_parameters()
+                x, _ = block(x)
+                x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+                x = x.transpose(-1, -2)
+                
+                x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
+                x_pad[:, :, :x.shape[-1]] = x
+                x = x_pad
+        
+        return x.transpose(-1, -2)
+
+
+# ================== Discriminators ==================
+
+class Discriminator2d(nn.Module):
+    """2D Discriminator for mel-spectrogram discrimination."""
+    
+    def __init__(self, dim_in: int = 48, num_domains: int = 1, 
+                 max_conv_dim: int = 384, repeat_num: int = 4):
+        super().__init__()
+        
+        blocks = [spectral_norm(nn.Conv2d(1, dim_in, 3, 1, 1))]
+
+        for _ in range(repeat_num):
+            dim_out = min(dim_in * 2, max_conv_dim)
+            blocks.append(ResBlk(dim_in, dim_out, downsample='half'))
+            dim_in = dim_out
+
+        blocks.extend([
+            nn.LeakyReLU(0.2),
+            spectral_norm(nn.Conv2d(dim_out, dim_out, 5, 1, 0)),
+            nn.LeakyReLU(0.2),
+            nn.AdaptiveAvgPool2d(1),
+            spectral_norm(nn.Conv2d(dim_out, num_domains, 1, 1, 0))
+        ])
+        
+        self.main = nn.Sequential(*blocks)
+
+    def get_feature(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        features = []
+        for layer in self.main:
+            x = layer(x)
+            features.append(x)
+            
+        out = features[-1]
+        out = out.view(out.size(0), -1)  # (batch, num_domains)
+        return out, features
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        out, features = self.get_feature(x)
+        return out.squeeze(), features
+
+
+# ================== Prosody Predictor ==================
+
+class ProsodyPredictor(nn.Module):
+    """Prosody Predictor for duration, F0, and energy prediction."""
+    
+    def __init__(self, style_dim: int, d_hid: int, nlayers: int, max_dur: int = 50, 
+                 dropout: float = 0.1, vocab_size: int = 1000, embed_dim: int = 256):
+        super().__init__()
+
+        # Text embedding
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.embed_to_dhid = nn.Linear(embed_dim, d_hid) if embed_dim != d_hid else None
+
+        # Encoders
+        self.text_encoder = DurationEncoder(
+            sty_dim=style_dim, d_model=d_hid, nlayers=nlayers, dropout=dropout
+        )
+
+        # Duration prediction
+        self.lstm = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, 
+                           batch_first=True, bidirectional=True)
+        self.duration_proj = LinearNorm(d_hid, max_dur)
+
+        # F0 and energy prediction
+        self.shared = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, 
+                             batch_first=True, bidirectional=True)
+        
+        # F0 prediction blocks
+        self.F0 = nn.ModuleList([
+            AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout),
+            AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout),
+            AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout)
+        ])
+
+        # Energy prediction blocks
+        self.N = nn.ModuleList([
+            AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout),
+            AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout),
+            AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout)
+        ])
+
+        # Output projections
+        self.F0_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
+        self.N_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
+
+    def forward(self, texts: torch.Tensor, style: torch.Tensor, 
+                text_lengths: torch.Tensor, alignment: torch.Tensor, 
+                m: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Embed texts
+        x_emb = self.embedding(texts)  # [batch, seq_len, embed_dim]
+
+        if self.embed_to_dhid is not None:
+            x_emb = self.embed_to_dhid(x_emb)  # [batch, seq_len, d_hid]
+
+        # Text encoding
+        x_emb = x_emb.permute(0, 2, 1)  # [batch, d_hid, seq_len]
+        d = self.text_encoder(x_emb, style, text_lengths, m)
+
+        # Duration prediction
+        input_lengths = text_lengths.cpu().numpy()
+        x = nn.utils.rnn.pack_padded_sequence(
+            d, input_lengths, batch_first=True, enforce_sorted=False
+        )
+
+        m = m.to(text_lengths.device).unsqueeze(1)
+        self.lstm.flatten_parameters()
+        x, _ = self.lstm(x)
+        # Duration prediction continuation
+        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+        x = x.transpose(-1, -2)
+        
+        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
+        x_pad[:, :, :x.shape[-1]] = x
+        x = x_pad
+        x.masked_fill_(m, 0.0)
+        
+        duration = self.duration_proj(x.transpose(-1, -2))
+
+        # F0 and energy prediction
+        en_out = d.transpose(-1, -2)
+        batch_size = en_out.shape[0]
+        s_tiled = style.unsqueeze(1).expand(batch_size, en_out.shape[1], -1)
+        en_cat = torch.cat([en_out, s_tiled], dim=-1)
+        
+        # Pack for LSTM
+        en_packed = nn.utils.rnn.pack_padded_sequence(
+            en_cat, input_lengths, batch_first=True, enforce_sorted=False
+        )
+        self.shared.flatten_parameters()
+        en_out, _ = self.shared(en_packed)
+        en_out, _ = nn.utils.rnn.pad_packed_sequence(en_out, batch_first=True)
+
+        # Expand using alignment
+        en_out = alignment @ en_out
+        F0 = en_out.transpose(-1, -2)
+        N = en_out.transpose(-1, -2)
+
+        # F0 prediction through AdaIN blocks
+        for block in self.F0:
+            F0 = block(F0, style)
+        F0 = self.F0_proj(F0)
+
+        # Energy prediction through AdaIN blocks  
+        for block in self.N:
+            N = block(N, style)
+        N = self.N_proj(N)
+
+        return duration.squeeze(-1), F0.squeeze(1), N.squeeze(1)
+
+    def F0_energy(self, x: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict F0 and energy from encoded features."""
+        F0 = x.transpose(-1, -2)
+        N = x.transpose(-1, -2)
+        
+        for block in self.F0:
+            F0 = block(F0, s)
+        F0 = self.F0_proj(F0)
+        
+        for block in self.N:
+            N = block(N, s)
+        N = self.N_proj(N)
+        
+        return F0.squeeze(1), N.squeeze(1)
+
+
+# ================== Generator/Decoder ==================
+
+class Generator(nn.Module):
+    """Main Generator/Decoder that converts text to mel-spectrogram."""
+    
+    def __init__(self, style_dim: int = 128, resblock: str = "1", 
+                 upsample_rates: List[int] = [8, 8], upsample_initial_channel: int = 512,
+                 resblock_kernel_sizes: List[int] = [3, 7, 11], 
+                 resblock_dilation_sizes: List[List[int]] = [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+                 upsample_kernel_sizes: List[int] = [16, 16], gin_channels: int = 0):
+        super().__init__()
+        
+        self.num_kernels = len(resblock_kernel_sizes)
+        self.num_upsamples = len(upsample_rates)
+        self.conv_pre = weight_norm(nn.Conv1d(gin_channels, upsample_initial_channel, 7, 1, 3))
+        
+        # Upsampling layers
+        self.ups = nn.ModuleList()
+        for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            self.ups.append(weight_norm(
+                nn.ConvTranspose1d(upsample_initial_channel // (2**i),
+                                 upsample_initial_channel // (2**(i+1)),
+                                 k, u, padding=(k-u)//2)
+            ))
+
+        # Residual blocks
+        self.resblocks = nn.ModuleList()
+        for i in range(len(self.ups)):
+            ch = upsample_initial_channel // (2**(i+1))
+            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
+                self.resblocks.append(ResBlock1(ch, k, d))
+
+        # Style-aware convolutions
+        self.conv_posts = nn.ModuleList()
+        for i in range(len(self.ups)):
+            ch = upsample_initial_channel // (2**(i+1))
+            self.conv_posts.append(Conv1dAdaIN(ch, style_dim))
+
+        self.conv_post = weight_norm(nn.Conv1d(ch, 1, 7, 1, 3))
+        self.ups.apply(init_weights)
+        self.conv_post.apply(init_weights)
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        x = self.conv_pre(x)
+        
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, 0.1)
+            x = self.ups[i](x)
+            
+            # Apply style-aware convolution
+            x = self.conv_posts[i](x, s)
+            
+            # Residual blocks
+            xs = None
+            for j in range(self.num_kernels):
+                if xs is None:
+                    xs = self.resblocks[i*self.num_kernels+j](x)
+                else:
+                    xs += self.resblocks[i*self.num_kernels+j](x)
+            x = xs / self.num_kernels
+            
+        x = F.leaky_relu(x)
+        x = self.conv_post(x)
+        x = torch.tanh(x)
+        
+        return x
+
+    def remove_weight_norm(self):
+        """Remove weight normalization for inference."""
+        for layer in self.ups:
+            nn.utils.remove_weight_norm(layer)
+        for layer in self.resblocks:
+            layer.remove_weight_norm()
+        nn.utils.remove_weight_norm(self.conv_pre)
+        nn.utils.remove_weight_norm(self.conv_post)
+
+
+class ResBlock1(nn.Module):
+    """1D Residual Block for the Generator."""
+    
+    def __init__(self, channels: int, kernel_size: int = 3, dilation: List[int] = [1, 3, 5]):
+        super().__init__()
+        self.convs1 = nn.ModuleList([
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, 
+                                dilation=dilation[0], padding=get_padding(kernel_size, dilation[0]))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, 
+                                dilation=dilation[1], padding=get_padding(kernel_size, dilation[1]))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, 
+                                dilation=dilation[2], padding=get_padding(kernel_size, dilation[2])))
+        ])
+        self.convs1.apply(init_weights)
+
+        self.convs2 = nn.ModuleList([
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, 
+                                dilation=1, padding=get_padding(kernel_size, 1))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, 
+                                dilation=1, padding=get_padding(kernel_size, 1))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, 
+                                dilation=1, padding=get_padding(kernel_size, 1)))
+        ])
+        self.convs2.apply(init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = F.leaky_relu(x, 0.1)
+            xt = c1(xt)
+            xt = F.leaky_relu(xt, 0.1)
+            xt = c2(xt)
+            x = xt + x
+        return x
+
+    def remove_weight_norm(self):
+        for layer in self.convs1:
+            nn.utils.remove_weight_norm(layer)
+        for layer in self.convs2:
+            nn.utils.remove_weight_norm(layer)
+
+
+# ================== Style Diffusion Model ==================
+
+class DiffusionEmbedding(nn.Module):
+    """Diffusion timestep embedding."""
+    
+    def __init__(self, max_steps: int, embedding_dim: int = 128):
+        super().__init__()
+        self.register_buffer('embedding', self._build_embedding(max_steps, embedding_dim))
+
+    def _build_embedding(self, max_steps: int, embedding_dim: int) -> torch.Tensor:
+        steps = torch.arange(max_steps).unsqueeze(1)
+        dims = torch.arange(embedding_dim).unsqueeze(0)
+        table = steps * 10.0**(dims * 4.0 / embedding_dim)
+        table = torch.cat([torch.sin(table), torch.cos(table)], dim=1)
+        return table
+
+    def forward(self, diffusion_step: torch.Tensor) -> torch.Tensor:
+        return self.embedding[diffusion_step]
+
+
+class StyleDiffusion(nn.Module):
+    """Style Diffusion Model for generating style embeddings."""
+    
+    def __init__(self, n_feats: int = 80, dim: int = 64, beta_min: float = 0.05, 
+                 beta_max: float = 20.0, pe_scale: int = 1000):
+        super().__init__()
+        self.n_feats = n_feats
+        self.dim = dim
+        self.beta_min = beta_min
+        self.beta_max = beta_max
+        self.pe_scale = pe_scale
+
+        # Encoder
+        self.encoder = nn.ModuleList([
+            nn.Conv1d(1, dim, 3, 1, 1),
+            ResBlk1d(dim, dim, actv=nn.Mish()),
+            ResBlk1d(dim, dim, actv=nn.Mish())
+        ])
+
+        # Decoder  
+        self.decoder = nn.ModuleList([
+            ResBlk1d(dim, dim, actv=nn.Mish()),
+            ResBlk1d(dim, dim, actv=nn.Mish()),
+            nn.Conv1d(dim, 1, 3, 1, 1)
+        ])
+
+        # Diffusion embedding
+        self.diffusion_embedding = DiffusionEmbedding(1000)
+        self.mlp = nn.Sequential(
+            nn.Linear(256, dim * 4),
+            nn.Mish(),
+            nn.Linear(dim * 4, dim)
+        )
+
+    def forward(self, spec: torch.Tensor, diffusion_step: torch.Tensor, 
+                cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            spec: [B, n_feats, T] - input spectrogram
+            diffusion_step: [B] - diffusion timesteps
+            cond: [B, cond_dim] - conditioning (optional)
+        """
+        x = spec.unsqueeze(1) if spec.dim() == 2 else spec
+        
+        # Encode
+        for layer in self.encoder:
+            x = layer(x)
+            
+        # Add diffusion timestep embedding
+        diffusion_emb = self.diffusion_embedding(diffusion_step)
+        diffusion_emb = self.mlp(diffusion_emb).unsqueeze(-1)
+        x = x + diffusion_emb
+        
+        # Add conditioning if provided
+        if cond is not None:
+            cond = cond.unsqueeze(-1).expand(-1, -1, x.size(-1))
+            x = x + cond
+            
+        # Decode
+        for layer in self.decoder:
+            x = layer(x)
+            
+        return x.squeeze(1)
+
+    def compute_loss(self, x0: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute diffusion training loss."""
+        b, device = x0.size(0), x0.device
+        
+        # Sample timesteps
+        t = torch.randint(0, 1000, (b,), device=device)
+        
+        # Add noise
+        noise = torch.randn_like(x0)
+        alpha_t = self.get_alpha_t(t)
+        xt = alpha_t.sqrt() * x0 + (1 - alpha_t).sqrt() * noise
+        
+        # Predict noise
+        noise_pred = self.forward(xt, t, cond)
+        
+        # Compute loss
+        loss = F.mse_loss(noise_pred, noise)
+        return loss
+
+    def get_alpha_t(self, t: torch.Tensor) -> torch.Tensor:
+        """Get alpha values for given timesteps."""
+        beta_t = self.beta_min + (self.beta_max - self.beta_min) * t / 1000
+        alpha_t = torch.exp(-0.5 * beta_t)
+        return alpha_t
+
+
+# ================== Main StyleTTS2 Model ==================
+
+class StyleTTS2(nn.Module):
+    """Complete StyleTTS2 model with all components."""
+    
+    def __init__(self, config: dict):
+        super().__init__()
+        
+        # Extract config parameters
+        text_channels = config.get('text_channels', 512)
+        style_dim = config.get('style_dim', 128)
+        n_vocab = config.get('n_vocab', 1000)
+        
+        # Initialize components
+        self.text_encoder = TextEncoder(
+            channels=text_channels,
+            kernel_size=config.get('text_kernel_size', 5),
+            depth=config.get('text_depth', 4),
+            n_symbols=n_vocab
+        )
+        
+        self.style_encoder = StyleEncoder(
+            dim_in=config.get('style_dim_in', 48),
+            style_dim=style_dim,
+            max_conv_dim=config.get('style_max_conv_dim', 384)
+        )
+        
+        self.prosody_predictor = ProsodyPredictor(
+            style_dim=style_dim,
+            d_hid=config.get('prosody_d_hid', 256),
+            nlayers=config.get('prosody_nlayers', 2),
+            vocab_size=n_vocab,
+            embed_dim=config.get('prosody_embed_dim', 256)
+        )
+        
+        self.generator = Generator(
+            style_dim=style_dim,
+            upsample_rates=config.get('upsample_rates', [8, 8]),
+            upsample_initial_channel=config.get('upsample_initial_channel', 512),
+            gin_channels=config.get('gin_channels', 80)
+        )
+        
+        self.style_diffusion = StyleDiffusion(
+            n_feats=config.get('n_mel_channels', 80),
+            dim=config.get('diffusion_dim', 64)
+        )
+        
+        self.discriminator = Discriminator2d(
+            dim_in=config.get('disc_dim_in', 48),
+            num_domains=config.get('num_domains', 1)
+        )
+
+    def forward(self, texts: torch.Tensor, text_lengths: torch.Tensor,
+                ref_mels: torch.Tensor, mel_lengths: torch.Tensor) -> dict:
+        """Forward pass for training."""
+        
+        # Create masks
+        text_mask = self.text_encoder.length_to_mask(text_lengths)
+        
+        # Encode text
+        text_encoded = self.text_encoder(texts, text_lengths, text_mask)
+        
+        # Encode reference style
+        ref_style = self.style_encoder(ref_mels.unsqueeze(1))
+        
+        # Predict prosody (duration, F0, energy)
+        # For training, we need alignment - this would typically come from forced alignment
+        # Here we create a dummy alignment for demonstration
+        max_text_len = texts.size(1)
+        max_mel_len = ref_mels.size(-1)
+        alignment = torch.eye(max_text_len, max_mel_len, device=texts.device)
+        alignment = alignment.unsqueeze(0).expand(texts.size(0), -1, -1)
+        
+        duration, f0, energy = self.prosody_predictor(
+            texts, ref_style, text_lengths, alignment, text_mask
+        )
+        
+        # Generate mel-spectrogram
+        generated_mel = self.generator(text_encoded, ref_style)
+        
+        # Discriminator forward pass
+        real_scores, real_features = self.discriminator(ref_mels.unsqueeze(1))
+        fake_scores, fake_features = self.discriminator(generated_mel.unsqueeze(1))
+        
+        return {
+            'generated_mel': generated_mel,
+            'duration': duration,
+            'f0': f0, 
+            'energy': energy,
+            'ref_style': ref_style,
+            'real_scores': real_scores,
+            'fake_scores': fake_scores,
+            'real_features': real_features,
+            'fake_features': fake_features
+        }
+
+    def inference(self, texts: torch.Tensor, ref_mel: torch.Tensor) -> torch.Tensor:
+        """Inference mode - generate mel from text and reference."""
+        self.eval()
+        
+        with torch.no_grad():
+            # Encode reference style
+            ref_style = self.style_encoder(ref_mel.unsqueeze(0).unsqueeze(1))
+            
+            # Encode text
+            text_encoded = self.text_encoder.inference(texts.unsqueeze(0))
+            text_encoded = text_encoded.transpose(1, 2)
+            
+            # Generate mel-spectrogram
+            generated_mel = self.generator(text_encoded, ref_style)
+            
+        return generated_mel.squeeze(0)
+
+
+# ================== Utility Functions ==================
+
+def init_weights(m: nn.Module, mean: float = 0.0, std: float = 0.01):
+    """Initialize weights for conv and linear layers."""
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        m.weight.data.normal_(mean, std)
+
+
+def get_padding(kernel_size: int, dilation: int = 1) -> int:
+    """Calculate padding for convolution."""
+    return int((kernel_size * dilation - dilation) / 2)
+
+
+def load_config(config_path: str) -> dict:
+    """Load configuration from YAML file."""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+# ================== Training Utilities ==================
+
+class StyleTTS2Loss:
+    """Loss functions for StyleTTS2 training."""
+    
+    def __init__(self, lambda_adv: float = 1.0, lambda_mel: float = 45.0, 
+                 lambda_feat: float = 2.0, lambda_dur: float = 1.0):
+        self.lambda_adv = lambda_adv
+        self.lambda_mel = lambda_mel
+        self.lambda_feat = lambda_feat  
+        self.lambda_dur = lambda_dur
+
+    def generator_loss(self, outputs: dict, targets: dict) -> dict:
+        """Compute generator losses."""
+        
+        # Adversarial loss
+        adv_loss = F.binary_cross_entropy_with_logits(
+            outputs['fake_scores'], 
+            torch.ones_like(outputs['fake_scores'])
+        )
+        
+        # Mel reconstruction loss
+        mel_loss = F.l1_loss(outputs['generated_mel'], targets['mel'])
+        
+        # Feature matching loss
+        feat_loss = 0
+        for real_feat, fake_feat in zip(outputs['real_features'], outputs['fake_features']):
+            feat_loss += F.l1_loss(fake_feat, real_feat)
+        
+        # Duration loss (if available)
+        dur_loss = 0
+        if 'duration_target' in targets:
+            dur_loss = F.mse_loss(outputs['duration'], targets['duration_target'])
+        
+        # Total generator loss
+        total_loss = (self.lambda_adv * adv_loss + 
+                     self.lambda_mel * mel_loss + 
+                     self.lambda_feat * feat_loss + 
+                     self.lambda_dur * dur_loss)
+        
+        return {
+            'total': total_loss,
+            'adversarial': adv_loss,
+            'mel': mel_loss, 
+            'feature': feat_loss,
+            'duration': dur_loss
+        }
+
+    def discriminator_loss(self, outputs: dict) -> dict:
+        """Compute discriminator losses."""
+        
+        # Real loss
+        real_loss = F.binary_cross_entropy_with_logits(
+            outputs['real_scores'],
+            torch.ones_like(outputs['real_scores'])
+        )
+        
+        # Fake loss  
+        fake_loss = F.binary_cross_entropy_with_logits(
+            outputs['fake_scores'],
+            torch.zeros_like(outputs['fake_scores'])
+        )
+        
+        # Total discriminator loss
+        total_loss = (real_loss + fake_loss) / 2
+        
+        return {
+            'total': total_loss,
+            'real': real_loss,
+            'fake': fake_loss
+        }
+
+
+# ================== Example Usage ==================
+
+def create_model(config_path: str) -> StyleTTS2:
+    """Create StyleTTS2 model from config."""
+    config = load_config(config_path)
+    model = StyleTTS2(config)
+    return model
+
+
+def example_forward():
+    """Example of how to use the model."""
+    
+    # Example config
+    config = {
+        'text_channels': 512,
+        'style_dim': 128,
+        'n_vocab': 1000,
+        'n_mel_channels': 80,
+        'upsample_rates': [8, 8],
+        'upsample_initial_channel': 512,
+        'gin_channels': 80
+    }
+    
+    # Create model
+    model = StyleTTS2(config)
+    
+    # Example inputs
+    batch_size = 2
+    max_text_len = 50
+    max_mel_len = 200
+    n_mel_channels = 80
+    
+    texts = torch.randint(0, 1000, (batch_size, max_text_len))
+    text_lengths = torch.tensor([45, 40])
+    ref_mels = torch.randn(batch_size, n_mel_channels, max_mel_len)
+    mel_lengths = torch.tensor([180, 160])
+    
+    # Forward pass
+    outputs = model(texts, text_lengths, ref_mels, mel_lengths)
+    
+    print("Generated mel shape:", outputs['generated_mel'].shape)
+    print("F0 shape:", outputs['f0'].shape)
+    print("Energy shape:", outputs['energy'].shape)
+
+
+if __name__ == "__main__":
+    example_forward()
